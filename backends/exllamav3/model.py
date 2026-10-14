@@ -229,6 +229,10 @@ class ExllamaV3Container:
     draft_config: Optional[Config] = None
     generator: Optional[AsyncGenerator] = None
     vision_model: Optional[Model] = None
+    # MiniCPM-V 4.7 is not an ExLlama vision component. The adapter bridge
+    # owns the BF16 tower and packs each image request into one embedding.
+    is_minicpm: bool = False
+    minicpm_vision: Optional[Any] = None
 
     # Class-specific vars
     gpu_split: Optional[List[float]] = None
@@ -298,6 +302,19 @@ class ExllamaV3Container:
 
         self.model_dir = model_directory
         self.hf_model = hf_model
+        # The adapter has to register MiniCPMV4_7 before ExLlama reads config.json.
+        # Its chat template already emits the BOS token, so a second one would
+        # shift every position.
+        from backends.exllamav3.minicpm import register_minicpm
+
+        self.is_minicpm = register_minicpm(model_directory)
+        if self.is_minicpm:
+            if self.hf_model.tokenizer_config is not None:
+                self.hf_model.tokenizer_config.add_bos_token = False
+            xlogger.info(
+                "MiniCPM-V 4.7 adapter registered. "
+                "Images go through its vision bridge, and this checkpoint has no MTP head."
+            )
         # Optional RYS layer map (list of layer indices or a string spec such
         # as "0..6,4..6"); must be set when the config is created so the model
         # is built with the mapped layer order
@@ -351,7 +368,14 @@ class ExllamaV3Container:
         # Must be set before the vision component is loaded
         self.config.infer_params.vision_pinned = unwrap(kwargs.get("vision_offload"), False)
         if self.use_vision:
-            if "vision" in self.config.model_classes:
+            if self.is_minicpm:
+                image_embedding_cache.configure(config.memory.sysmem_multimodal_cache)
+                xlogger.info(
+                    "MiniCPM vision is enabled. Each image request is packed by the "
+                    "adapter bridge at 16x and one slice unless the request sets "
+                    "downsample_mode or max_slice_nums."
+                )
+            elif "vision" in self.config.model_classes:
                 self.vision_model = Model.from_config(self.config, component="vision")
                 if self.config.infer_params.vision_pinned:
                     xlogger.info("Keeping vision model weights in system RAM (vision_offload).")
@@ -373,6 +397,12 @@ class ExllamaV3Container:
         draft_mode = unwrap(draft_args.get("draft_mode"), "model")
         if draft_mode not in {"model", "disabled", "mtp", "ngram"}:
             raise ValueError(f"Unknown exllamav3 draft mode: {draft_mode}")
+        if draft_mode == "mtp" and "mtp" not in self.config.model_classes:
+            xlogger.warning(
+                "draft_mode is mtp, but this checkpoint has no MTP component. "
+                "Drafting is disabled."
+            )
+            draft_mode = "disabled"
         draft_model_name = draft_args.get("draft_model_name")
         self.use_draft_model = draft_mode == "mtp" or (
             draft_mode == "model" and bool(draft_model_name)
@@ -553,6 +583,11 @@ class ExllamaV3Container:
         # Max batch size
         default_mbs = 4 if self.model.caps.get("recurrent_states") else 128
         self.max_batch_size = unwrap(kwargs.get("max_batch_size"), default_mbs)
+        if self.is_minicpm and self.max_batch_size != 1:
+            xlogger.warning(
+                f"MiniCPM vision was qualified at batch size 1. "
+                f"max_batch_size is {self.max_batch_size}."
+            )
 
         # Recurrent checkpoint intervals (None = engine defaults)
         self.recurrent_checkpoint_interval = kwargs.get("recurrent_checkpoint_interval")
@@ -1078,7 +1113,14 @@ class ExllamaV3Container:
     def load_model_sync(self, progress_callback=None):
         # exllamav3 asserts on reserve_per_device and use_per_device together,
         # so a model with a manual split gets the split and not the reserve
-        if self.use_vision:
+        if self.is_minicpm and self.use_vision and self.minicpm_vision is None:
+            from backends.exllamav3.minicpm import MiniCPMVision
+
+            xlogger.info("Loading MiniCPM vision tower")
+            self.minicpm_vision = MiniCPMVision(str(self.model_dir.resolve()), "cuda:0")
+            xlogger.info("MiniCPM vision tower loaded")
+
+        if self.vision_model is not None:
             for value in self.vision_model.load_gen(
                 reserve_per_device=None if self.gpu_split else self.autosplit_reserve,
                 use_per_device=self.gpu_split or None,
@@ -1275,9 +1317,12 @@ class ExllamaV3Container:
                 self.draft_config = None
                 self.draft_cache = None
 
-            if self.use_vision:
+            if self.vision_model is not None:
                 self.vision_model.unload()
                 self.vision_model = None
+            if self.minicpm_vision is not None:
+                self.minicpm_vision.close()
+                self.minicpm_vision = None
 
             gc.collect()
             torch.cuda.empty_cache()

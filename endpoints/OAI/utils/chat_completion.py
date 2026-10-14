@@ -16,6 +16,7 @@ from common.errors import (
 from common.logger import xlogger
 import re
 
+from backends.exllamav3.minicpm import MiniCPMRequestError, messages_have_image
 from common import model
 from common.multimodal import MultimodalEmbeddingWrapper
 from common.networking import (
@@ -317,6 +318,17 @@ def _sort_tool_messages(message_dicts: List[dict]):
             message_dicts[run_start:i] = run
 
 
+def _message_text(message: ChatCompletionMessage) -> str:
+    content = message.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.text or "" for part in content if getattr(part, "type", None) == "text"
+        )
+    return ""
+
+
 async def format_messages_with_template(
     messages: List[ChatCompletionMessage],
     existing_template_vars: Optional[dict] = None,
@@ -324,6 +336,31 @@ async def format_messages_with_template(
     """Barebones function to format chat completion messages into a prompt."""
 
     template_vars = unwrap(existing_template_vars, {})
+    if getattr(model.container, "is_minicpm", False) and messages_have_image(messages):
+        if any(
+            CONTINUE_FINAL_MESSAGE_TAG in _message_text(message)
+            for message in messages
+        ):
+            raise MiniCPMRequestError(
+                "continue_final_message cannot be combined with images on MiniCPM"
+            )
+        if model.container.minicpm_vision is None:
+            raise MiniCPMRequestError(
+                "MiniCPM vision tower is not loaded. Leave model.vision enabled."
+            )
+        try:
+            alias, packed = await model.container.minicpm_vision.prompt(
+                messages, template_vars
+            )
+        except (MiniCPMRequestError, HTTPException):
+            raise
+        except Exception as exc:
+            raise MiniCPMRequestError(str(exc)) from exc
+        mm_embeddings = MultimodalEmbeddingWrapper()
+        mm_embeddings.content.extend(packed)
+        mm_embeddings.text_alias.append(alias)
+        return alias, mm_embeddings, template_vars
+
     mm_embeddings = MultimodalEmbeddingWrapper() if model.container.use_vision else None
 
     # Convert all messages to a dictionary representation
@@ -558,6 +595,9 @@ async def apply_chat_template(data: ChatCompletionRequest):
 
         return prompt, mm_embeddings
 
+    except MiniCPMRequestError as exc:
+        error_message = handle_request_error(str(exc), exc_info=False).error.message
+        raise HTTPException(400, error_message) from exc
     except KeyError as exc:
         error_message = handle_request_error(
             "Could not find a Conversation from prompt template "
